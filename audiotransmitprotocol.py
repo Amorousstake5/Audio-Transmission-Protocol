@@ -1,161 +1,189 @@
-# Version 4 of Audio Transmission Protocol with 4 - FSK transmission
+# Version 7 of Audio Transmission Protocol with 4 - FSK transmission
 import numpy as np
 import sounddevice as sd
 import scipy.signal as signal
 import zlib
+import os
+import sys
 from PIL import Image
 import matplotlib.pyplot as plt
 
 # --- IEEE Project Specs: 4-FSK ---
 FS = 44100
 FREQS = [1000, 1500, 2000, 2500] 
-BIT_DURATION = 0.02             # 20ms per symbol (2 bits)
+BIT_DURATION = 0.02             # 20ms symbols
 PREAMBLE = [1, 0, 1, 0, 1, 0, 1, 1] 
 
-class SuperFastModem:
+# Gray Code Mapping: 00, 01, 11, 10
+GRAY_MAP = [0, 1, 3, 2] 
+INV_GRAY_MAP = {v: k for k, v in enumerate(GRAY_MAP)}
+
+class UnifiedIEEEModem:
     def __init__(self):
         self.spb = int(FS * BIT_DURATION)
-        self.stats = {"mags": [], "decisions": [], "true_bits": []}
+        self.stats = {"true_bits": [], "decoded_bits": [], "confidence": []}
 
     def _get_tone(self, freq, samples):
         t = np.linspace(0, samples/FS, samples, endpoint=False)
         return np.sin(2 * np.pi * freq * t)
 
-    def encode_image(self, img_path):
-        # 1. Image Processing
-        # 1. Prepare Image
-        # Replace 'test.png' with your file or use a simple generated block
-        img = Image.new('L', (32, 32), color=126) # Creating a gray square as a placeholder
-        # img = Image.open(img_path).convert('L').resize((32, 32)) 
-        raw_bytes = np.array(img).tobytes()
-        compressed = zlib.compress(raw_bytes)
-        
-        # 2. Add Header & Convert to Bits
+    def print_progress(self, iteration, total, prefix='', suffix='', length=30, fill='█'):
+        percent = ("{0:.1f}").format(100 * (iteration / float(total)))
+        filled_length = int(length * iteration // total)
+        bar = fill * filled_length + '-' * (length - filled_length)
+        sys.stdout.write(f'\r{prefix} |{bar}| {percent}% {suffix}')
+        sys.stdout.flush()
+        if iteration == total: print()
+
+    def encode(self, data_bytes):
+        """Generic encoder for any byte stream (Text or Image)."""
+        compressed = zlib.compress(data_bytes, level=9)
         payload = len(compressed).to_bytes(2, 'big') + compressed
+        
         bits = []
         for b in payload:
             bits.extend([int(x) for x in format(b, '08b')])
-        
-        # Save for BER calculation
         self.stats["true_bits"] = bits
         
-        # 3. Generate Audio
         audio = []
+        # Preamble
         for bit in PREAMBLE:
             audio.extend(self._get_tone(FREQS[3] if bit==1 else FREQS[0], self.spb))
-            
+        # Payload
         for i in range(0, len(bits), 2):
-            dibit = bits[i:i+2]
-            if len(dibit) < 2: dibit += [0]
-            val = int("".join(map(str, dibit)), 2)
-            audio.extend(self._get_tone(FREQS[val], self.spb))
+            val = int("".join(map(str, bits[i:i+2])), 2)
+            freq_idx = GRAY_MAP[val]
+            audio.extend(self._get_tone(FREQS[freq_idx], self.spb))
             
-        return np.array(audio, dtype=np.float32), compressed
+        return np.array(audio, dtype=np.float32), len(compressed)
 
-    def decode_image(self, rec_sig):
-        # 1. Normalize and Sync
+    def decode(self, rec_sig):
+        """Demodulator with real-time progress and SNR tracking."""
         rec_sig = rec_sig - np.mean(rec_sig)
         rec_sig /= (np.max(np.abs(rec_sig)) + 1e-9)
         
         sync_ref = []
         for bit in PREAMBLE:
             sync_ref.extend(self._get_tone(FREQS[3] if bit==1 else FREQS[0], self.spb))
-        
         corr = signal.correlate(rec_sig, sync_ref, mode='valid')
         start_idx = np.argmax(np.abs(corr)) + len(sync_ref)
         
-        # 2. Extract and Track Quality
         bits = []
-        confidence_scores = []
+        confidence = []
+        total_symbols = (len(rec_sig) - start_idx) // self.spb
         
-        for i in range(start_idx, len(rec_sig) - self.spb, self.spb):
+        print("[*] Decoding Acoustic Stream...")
+        for count, i in enumerate(range(start_idx, len(rec_sig) - self.spb, self.spb)):
             chunk = rec_sig[i : i + self.spb]
             t = np.linspace(0, len(chunk)/FS, len(chunk), endpoint=False)
             
-            mags = []
-            for f in FREQS:
-                # Quadrature Detection
-                s = np.sum(chunk * np.sin(2 * np.pi * f * t))
-                c = np.sum(chunk * np.cos(2 * np.pi * f * t))
-                mags.append(np.sqrt(s**2 + c**2))
+            mags = [np.sqrt(np.sum(chunk * np.sin(2*np.pi*f*t))**2 + 
+                            np.sum(chunk * np.cos(2*np.pi*f*t))**2) for f in FREQS]
             
             best_val = np.argmax(mags)
+            actual_val = INV_GRAY_MAP[best_val]
+            bits.extend([int(x) for x in format(actual_val, '02b')])
             
-            # Calibration Metric: Margin of Victory
-            # Ratio of winning frequency power vs the average of others
+            # Confidence Calculation (SNR Proxy)
             others = [m for idx, m in enumerate(mags) if idx != best_val]
-            margin = mags[best_val] / (np.mean(others) + 1e-9)
-            confidence_scores.append(margin)
+            confidence.append(mags[best_val] / (np.mean(others) + 1e-9))
             
-            bits.extend([int(x) for x in format(best_val, '02b')])
+            if count % 10 == 0:
+                self.print_progress(count, total_symbols, prefix='Progress', suffix='Complete')
 
-        self.stats["confidence"] = confidence_scores
-        self.stats["decoded_bits"] = bits
+        self.print_progress(total_symbols, total_symbols, prefix='Progress', suffix='Complete')
+        self.stats["decoded_bits"], self.stats["confidence"] = bits, confidence
 
-        # 3. Reconstruct
-        decoded_bytes = []
-        for i in range(0, len(bits) - (len(bits)%8), 8):
-            decoded_bytes.append(int("".join(map(str, bits[i:i+8])), 2))
+        byte_data = []
+        for i in range(0, len(bits)-(len(bits)%8), 8):
+            byte_data.append(int("".join(map(str, bits[i:i+8])), 2))
         
-        if len(decoded_bytes) < 2: return None
-        data_len = int.from_bytes(bytes(decoded_bytes[:2]), 'big')
-        return bytes(decoded_bytes[2:2+data_len])
+        if len(byte_data) < 2: return None
+        d_len = int.from_bytes(bytes(byte_data[:2]), 'big')
+        return bytes(byte_data[2:2+d_len])
 
-    def plot_calibration(self):
-        """Generates the Signal Quality and BER plots."""
-        # Calculate BER
+    def show_calibration(self):
         true = self.stats["true_bits"]
         decoded = self.stats["decoded_bits"][:len(true)]
         errors = np.array(true) != np.array(decoded)
         ber = (np.sum(errors) / len(true)) * 100 if len(true) > 0 else 0
 
-        plt.figure(figsize=(12, 6))
-        
-        # Subplot 1: Signal Confidence (Quality)
+        plt.figure(figsize=(10, 5))
         plt.subplot(2, 1, 1)
-        plt.plot(self.stats["confidence"], color='blue', alpha=0.7, label="Signal Margin")
-        plt.axhline(y=2.0, color='red', linestyle='--', label="Unreliable Threshold")
-        plt.title(f"Hardware Calibration: Signal Confidence (Avg: {np.mean(self.stats['confidence']):.2f})")
-        plt.ylabel("Signal-to-Noise Ratio")
+        plt.plot(self.stats["confidence"], color='teal', label="Confidence")
+        plt.axhline(y=2.5, color='red', linestyle='--', label="Fail Limit")
+        plt.title(f"Channel Quality (Avg Confidence: {np.mean(self.stats['confidence']):.2f})")
         plt.legend()
-
-        # Subplot 2: Error Distribution
         plt.subplot(2, 1, 2)
-        plt.stem(errors, markerfmt=' ', linefmt='red', label="Bit Errors")
-        plt.title(f"Bit Error Distribution (Total BER: {ber:.2f}%)")
-        plt.xlabel("Bit Index")
-        plt.ylabel("Error (1=Wrong)")
-        plt.legend()
-
+        plt.stem(errors, markerfmt=' ', linefmt='red')
+        plt.title(f"Bit Error Distribution (BER: {ber:.2f}%)")
         plt.tight_layout()
         plt.show()
         return ber
 
-# --- EXECUTION ---
-modem = SuperFastModem()
-IMAGE_PATH = "input.jpeg" # Insert a 32x32 image! To insert comment out or remove the img dummy
-
-
-try:
-    # 1. Transmit
-    audio_signal, compressed_original = modem.encode_image(IMAGE_PATH)
-    print(f"Sending... Duration: {len(audio_signal)/FS:.2f}s")
-    rec = sd.playrec(np.concatenate([np.zeros(FS), audio_signal, np.zeros(FS)]), FS, channels=1)
-    sd.wait()
-
-    # 2. Decode
-    received_data = modem.decode_image(rec.flatten())
-    
-    # 3. Calibrate & Display
-    ber = modem.plot_calibration()
-    
-    if ber == 0:
-        raw_img = zlib.decompress(received_data)
-        final_img = Image.frombytes('L', (32, 32), raw_img)
-        final_img.show()
-        print("Success! BER is 0.00%. Calibration Optimal.")
+# --- Utilities ---
+def get_synthesized_image():
+    print("\n[Dummy Generator] 1: BW (Grayscale) | 2: Color (ARGB)")
+    mode = input("Select: ")
+    if mode == '1':
+        val = int(input("Brightness (0-255): "))
+        return Image.new('L', (32, 32), color=val)
     else:
-        print(f"Calibration Failed: BER is {ber:.2f}%. Check volume/distance.")
+        print("Enter ARGB values (0-255):")
+        a, r, g, b = int(input("Alpha: ")), int(input("Red: ")), int(input("Green: ")), int(input("Blue: "))
+        return Image.new('RGBA', (32, 32), color=(r, g, b, a))
 
-except Exception as e:
-    print(f"Error: {e}")
+# --- Main CLI ---
+def main():
+    modem = UnifiedIEEEModem()
+    print("\n" + "="*40 + "\n IEEE UNIFIED 4-FSK MODEM 2026 \n" + "="*40)
+    
+    while True:
+        mode_select = input("\nTransmit: [1] Text [2] Image [Q] Quit: ").upper()
+        if mode_select == 'Q': break
+        
+        data_bytes = b""
+        img_mode = None
+
+        if mode_select == '1':
+            msg = input("Enter Text: ")
+            data_bytes = msg.encode('utf-8')
+        elif mode_select == '2':
+            src = input("  Source: [D] Dummy [F] File: ").upper()
+            if src == 'D':
+                img_obj = get_synthesized_image()
+            else:
+                path = input("  Path: ")
+                if not os.path.exists(path): continue
+                img_obj = Image.open(path).resize((32, 32))
+            img_obj.show(title="Original")
+            img_mode = img_obj.mode
+            data_bytes = np.array(img_obj).tobytes()
+        else: continue
+
+        # Transmission
+        audio, c_len = modem.encode(data_bytes)
+        print(f"[*] Compressed: {c_len}B. Playing ({len(audio)/FS:.1f}s)...")
+        rec = sd.playrec(np.concatenate([np.zeros(FS), audio, np.zeros(FS)]), FS, channels=1)
+        sd.wait()
+        
+        # Decoding
+        try:
+            received_bytes = modem.decode(rec.flatten())
+            ber = modem.show_calibration()
+            
+            if ber == 0:
+                raw = zlib.decompress(received_bytes)
+                if mode_select == '1':
+                    print(f"\n>> Received Text: {raw.decode('utf-8')}")
+                else:
+                    final_img = Image.frombytes(img_mode, (32, 32), raw)
+                    final_img.show(title="Received")
+                    print("\n>> Image Reconstruction Success.")
+            else:
+                print(f"\n!! BER: {ber:.2f}%. Check hardware distance.")
+        except Exception as e:
+            print(f"\n!! Recovery Error: {e}")
+
+if __name__ == "__main__":
+    main()
