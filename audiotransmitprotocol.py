@@ -1,3 +1,4 @@
+# Version 4 of Audio Transmission Protocol with 4 - FSK transmission
 import numpy as np
 import sounddevice as sd
 import scipy.signal as signal
@@ -22,7 +23,10 @@ class SuperFastModem:
 
     def encode_image(self, img_path):
         # 1. Image Processing
-        img = Image.open(img_path).convert('L').resize((32, 32))
+        # 1. Prepare Image
+        # Replace 'test.png' with your file or use a simple generated block
+        img = Image.new('L', (32, 32), color=126) # Creating a gray square as a placeholder
+        # img = Image.open(img_path).convert('L').resize((32, 32)) 
         raw_bytes = np.array(img).tobytes()
         compressed = zlib.compress(raw_bytes)
         
@@ -129,7 +133,8 @@ class SuperFastModem:
 
 # --- EXECUTION ---
 modem = SuperFastModem()
-IMAGE_PATH = "input2.jpeg" # Create a 32x32 image!
+IMAGE_PATH = "input.jpeg" # Insert a 32x32 image! To insert comment out or remove the img dummy
+
 
 try:
     # 1. Transmit
